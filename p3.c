@@ -15,27 +15,30 @@ int help;
 //locks
 pthread_mutex_t helpStudent;
 pthread_mutex_t modifyChairs;
-pthread_mutex_t modifyTutors;
 pthread_mutex_t modifyQueue;
 pthread_mutex_t modifyPriorities;
 pthread_mutex_t modifyRequests;
 pthread_mutex_t modifyHelped;
 pthread_mutex_t modifyStudentAlertCoordinator;
+pthread_mutex_t modifyTutorAvailable;
+pthread_mutex_t modifyTerminated;
 
 //semaphores
 sem_t coordinatorReady;
 sem_t tutorReady;
-sem_t studentReady;
+sem_t *studentReady;
 
 //others
 int availableChairs;
-int availableTutors;
 int totalHelp;
 int currentlyHelped;
 int requests;
+int terminated;
 int *studentPriorities;
 int *priorities;
 double *studentAlertCoordinator;
+int *tutorAvailable;
+int *tutorAlertStudent;
 
 double now()
 {
@@ -47,26 +50,53 @@ double now()
 void *tutorThread(void *threadID)
 {
     int tid = *((int *)threadID); //get threadID
-    //printf("Tutor thread %d\n", tid);
+    while (1)
+    {
+        sem_wait(&tutorReady);
+        if (currentlyHelped == totalHelp)
+            break;
+        int i;
+        pthread_mutex_lock(&modifyChairs);
+        availableChairs++;
+        pthread_mutex_unlock(&modifyChairs);
+        pthread_mutex_lock(&modifyPriorities);
+        int chosenStudent = -1;
+        for (i = 0; i < totalHelp; i++)
+        {
+            if (priorities[i] >= 0)
+            {
+                chosenStudent = priorities[i];
+                priorities[i] = -2;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&modifyPriorities);
+        tutorAlertStudent[chosenStudent] = tid;
+        sem_post(&studentReady[chosenStudent]);
+        usleep(200);
+        pthread_mutex_lock(&modifyHelped);
+        currentlyHelped++;
+        printf("T: Student %d tutored by Tutor %d. Students tutored now = %d. Total sessions tutored = %d\n", chosenStudent, tid, 0, currentlyHelped);
+        pthread_mutex_unlock(&modifyHelped);
+    }
     pthread_exit(NULL);
 }
 
 void *coordinatorThread()
 {
-    //printf("Coordinator thread\n");
     while (1)
     {
+        sem_wait(&coordinatorReady);
+        int i;
         if (currentlyHelped == totalHelp)
+        {
+            for (i = 0; i < tutors; i++)
+                sem_post(&tutorReady);
             break;
-        sem_wait(&studentReady);
-        pthread_mutex_lock(&modifyChairs);
-        availableChairs++;
-        pthread_mutex_unlock(&modifyChairs);
-        currentlyHelped++;
+        }
         pthread_mutex_lock(&modifyStudentAlertCoordinator);
         int minTid = 0;
         double minTime = studentAlertCoordinator[0];
-        int i;
         for (i = 1; i < students; i++)
         {
             if (studentAlertCoordinator[i] == -1.0)
@@ -83,28 +113,46 @@ void *coordinatorThread()
             }
         }
         studentAlertCoordinator[minTid] = -1.0;
-        pthread_mutex_lock(&modifyRequests);
-        printf("C: Student %d with priority %d in the queue. Waiting students now = %d. Total requests = %d\n", minTid, studentPriorities[minTid], totalChairs - availableChairs, requests);
-        pthread_mutex_unlock(&modifyRequests);
         pthread_mutex_unlock(&modifyStudentAlertCoordinator);
-        sem_post(&coordinatorReady);
-        printf("C: Serving. Chairs available: %d. Helped so far %d.\n", availableChairs, currentlyHelped);
-        usleep(200);
+        pthread_mutex_lock(&modifyRequests);
+        pthread_mutex_lock(&modifyPriorities);
+        pthread_mutex_lock(&modifyChairs);
+        for (i = studentPriorities[minTid] * students; i < (studentPriorities[minTid] + 1) * students; i++)
+        {
+            if (priorities[i] == -1)
+            {
+                priorities[i] = minTid;
+                break;
+            }
+        }
+        printf("C: Student %d with priority %d in the queue. Waiting students now = %d. Total requests = %d\n", minTid, studentPriorities[minTid], totalChairs - availableChairs, requests);
+        pthread_mutex_unlock(&modifyChairs);
+        pthread_mutex_unlock(&modifyPriorities);
+        pthread_mutex_unlock(&modifyRequests);
+        sem_post(&tutorReady);
     }
     pthread_exit(NULL);
 }
 
 void *studentThread(void *threadID)
 {
-    int tid = *((int *)threadID); //get threadID
-    //printf("Student thread %d\n", tid);
-    float program;
+    int tid = *((int *)threadID);
     while (1)
     {
         if (studentPriorities[tid] == help)
+        {
+            pthread_mutex_lock(&modifyTerminated);
+            terminated++;
+            if (terminated == students)
+            {
+                pthread_mutex_unlock(&modifyTerminated);
+                sem_post(&coordinatorReady);
+                break;
+            }
+            pthread_mutex_unlock(&modifyTerminated);
             break;
-        program = (float)(rand() % 201) / 100;
-        usleep(program * 1000); //check if this is in ms or micro
+        }
+        usleep((float)(rand() % 2001));
         pthread_mutex_lock(&modifyChairs);
         if (availableChairs == 0)
         {
@@ -117,19 +165,17 @@ void *studentThread(void *threadID)
             availableChairs--;
             printf("S: Student %d takes a seat. Empty chairs = %d. Priority = %d.\n", tid, availableChairs, studentPriorities[tid]);
             pthread_mutex_unlock(&modifyChairs);
-            sem_post(&studentReady);
             pthread_mutex_lock(&modifyStudentAlertCoordinator);
             studentAlertCoordinator[tid] = now();
             pthread_mutex_unlock(&modifyStudentAlertCoordinator);
             pthread_mutex_lock(&modifyRequests);
             requests++;
             pthread_mutex_unlock(&modifyRequests);
-            sem_wait(&coordinatorReady);
-            printf("S: Student %d is being served\n", tid);
+            sem_post(&coordinatorReady);
+            sem_wait(&studentReady[tid]);
             usleep(200);
-            pthread_mutex_lock(&modifyPriorities);
+            printf("S: Student %d received help from Tutor %d.\n", tid, tutorAlertStudent[tid]);
             studentPriorities[tid]++;
-            pthread_mutex_unlock(&modifyPriorities);
         }
     }
     pthread_exit(NULL);
@@ -142,18 +188,15 @@ void csmc()
     pthread_t studentThreads[students];
     pthread_mutex_init(&helpStudent, NULL);
     pthread_mutex_init(&modifyChairs, NULL);
-    pthread_mutex_init(&modifyTutors, NULL);
     pthread_mutex_init(&modifyQueue, NULL);
     pthread_mutex_init(&modifyPriorities, NULL);
     pthread_mutex_init(&modifyRequests, NULL);
     pthread_mutex_init(&modifyHelped, NULL);
     pthread_mutex_init(&modifyStudentAlertCoordinator, NULL);
+    pthread_mutex_init(&modifyTerminated, NULL);
     int i;
-    /* for (i = 0; i < students; i++)
+    for (i = 0; i < students; i++)
         sem_init(&studentReady[i], 0, 0);
-    for (i = 0; i < tutors; i++)
-        sem_init(&tutorReady[i], 0, 0); */
-    sem_init(&studentReady, 0, 0);
     sem_init(&tutorReady, 0, 0);
     sem_init(&coordinatorReady, 0, 0);
     if (pthread_create(&coordinator, NULL, (void *)coordinatorThread, NULL) != 0)
@@ -190,6 +233,7 @@ void csmc()
         pthread_join(tutorThreads[i], NULL);
     for (i = 0; i < students; i++)
         pthread_join(studentThreads[i], NULL);
+    return;
 }
 
 int main(int argc, char *argv[])
@@ -200,24 +244,32 @@ int main(int argc, char *argv[])
         write(STDERR_FILENO, error_message, strlen(error_message));
         exit(1);
     } */
-    students = 10;
-    tutors = 3;
-    totalChairs = 4;
-    help = 5;
+    students = 5;
+    tutors = 1;
+    totalChairs = 2;
+    help = 2;
     availableChairs = totalChairs;
-    availableTutors = tutors;
     totalHelp = students * help;
     currentlyHelped = 0;
     requests = 0;
+    terminated = 0;
     studentPriorities = (int *)malloc(students * sizeof(int));
     int i;
     for (i = 0; i < students; i++)
         *(studentPriorities + i) = 0;
-    priorities = (int *)malloc(students * help * sizeof(int));
+    priorities = (int *)malloc(totalHelp * sizeof(int));
+    for (i = 0; i < totalHelp; i++)
+        priorities[i] = -1;
     studentAlertCoordinator = (double *)malloc(students * sizeof(double));
     for (i = 0; i < students; i++)
         studentAlertCoordinator[i] = -1.0;
-    /* studentReady = (sem_t *)malloc(students * sizeof(sem_t));
-    tutorReady = (sem_t *)malloc(tutors * sizeof(sem_t)); */
+    tutorAlertStudent = (int *)malloc(students * sizeof(int));
+    for (i = 0; i < students; i++)
+        tutorAlertStudent[i] = -1;
+    tutorAvailable = (int *)malloc(tutors * sizeof(int));
+    studentReady = (sem_t *)malloc(students * sizeof(sem_t));
+    time_t t;
+    srand((unsigned)time(&t));
     csmc();
+    return 0;
 }
